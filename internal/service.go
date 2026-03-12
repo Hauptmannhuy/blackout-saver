@@ -6,36 +6,42 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
+	"slices"
+
+	"github.com/fsnotify/fsnotify"
 )
 
-const ConfigPath = "./config"
+const (
+	ConfigPath = "./config"
+	cfgName    = ConfigPath + "/" + "config.json"
+)
 
-type dataObserver struct {
-	folders []string
+type fileWatcher struct {
+	watcher *fsnotify.Watcher
+	config  *appConfig
 }
 
 type appConfig struct {
-	storageCreds map[string]string
-	Folders      []string `json:"folders"`
+	Folders  []string `json:"folders"`
+	Files    []string `json:"files"`
+	jsonFile *os.File
 }
 
 func getConfig() (*appConfig, error) {
 	path := filepath.Join(ConfigPath, "config.json")
-	f, err := os.Open(path)
+	jsonFile, err := getConfigJSONFile(path)
+	config := &appConfig{
+		jsonFile: jsonFile,
+	}
+
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			err = fmt.Errorf("file with given path is not exist %s", path)
-		}
 		return nil, err
 	}
 
-	decoder := json.NewDecoder(f)
+	decoder := json.NewDecoder(jsonFile)
 	if decoder == nil {
 		return nil, errors.New("couldn't initialize decoder")
 	}
-
-	var config appConfig
 
 	for decoder.More() {
 		err := decoder.Decode(&config)
@@ -43,24 +49,102 @@ func getConfig() (*appConfig, error) {
 			return nil, err
 		}
 	}
-	return &config, nil
+	fmt.Print(*config)
+	return config, nil
 }
 
-func (observer *dataObserver) start() {
-	for {
-		fmt.Println("do shit")
-		time.Sleep(1 * time.Second)
+func (fileWatcher *fileWatcher) start() {
+	for event := range fileWatcher.watcher.Events {
+		path := event.Name
+		if event.Has(fsnotify.Write) {
+			fmt.Printf("%s file was modified", path)
+		}
 	}
 }
 
-func Start() {
+func newfileWatcher(config *appConfig) (*fileWatcher, error) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, err
+	}
+	fileWatcher := &fileWatcher{
+		config:  config,
+		watcher: watcher,
+	}
+	for _, v := range append(config.Files, config.Folders...) {
+		err := watcher.Add(v)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return fileWatcher, nil
+}
+
+func Start() error {
 	config, err := getConfig()
 	if err != nil {
 		panic(err)
 	}
-	observer := dataObserver{
-		folders: config.Folders,
+	fileWatcher, err := newfileWatcher(config)
+	if err != nil {
+		return err
+	}
+	go fileWatcher.start()
+	return nil
+}
+
+func AddDirToWatch(filePath string) error {
+	var containerToAppend *[]string
+	config, err := getConfig()
+	cfgFile := config.jsonFile
+
+	if err != nil {
+		return err
+	}
+	fInfo, err := os.Stat(filePath)
+	if err != nil {
+		return fmt.Errorf("error during file %s validation, err %s", filePath, err.Error())
 	}
 
-	go observer.start()
+	containerToAppend = &config.Folders
+	if !fInfo.IsDir() {
+		containerToAppend = &config.Files
+	}
+
+	if slices.Contains(*containerToAppend, filePath) {
+		return fmt.Errorf("%s already in config", filePath)
+	}
+	*containerToAppend = append(*containerToAppend, filePath)
+
+	return config.saveToJSON(cfgFile)
+}
+
+func (config *appConfig) saveToJSON(file *os.File) error {
+	data, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+
+	_, err = file.WriteAt(data, 0)
+	if err != nil {
+		return err
+	}
+
+	return file.Close()
+}
+
+func getConfigJSONFile(filepath string) (*os.File, error) {
+	var f *os.File
+	_, err := os.Stat(filepath)
+	if err != nil && os.IsNotExist(err) {
+		var createErr error
+		f, createErr = os.OpenFile(filepath, os.O_RDWR|os.O_CREATE, 0644)
+		if createErr != nil {
+			return nil, errors.Join(err, createErr)
+		}
+		return f, nil
+
+	} else {
+		return os.OpenFile(filepath, os.O_RDWR, 0644)
+	}
 }

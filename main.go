@@ -1,12 +1,14 @@
 package main
 
 import (
-	"blackout-saver/internal"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"syscall"
+
+	"blackout-saver/internal"
 )
 
 func main() {
@@ -15,15 +17,34 @@ func main() {
 		panic("no args are specified")
 	}
 
-	startCmd := flag.CommandLine.Bool("start", true, "starts service")
+	args = args[1:]
+
+	startCmd := flag.CommandLine.Bool("start", false, "starts service")
+	addDirCmd := flag.CommandLine.String("add_dir", "", "makes watch over given directories")
+
 	flag.Parse()
-	if startCmd != nil {
-		internal.Start()
+	fmt.Println(*startCmd)
+	fmt.Println(*addDirCmd)
+	if startCmd != nil && *startCmd == true {
+		if err := internal.Start(); err != nil {
+			log.Fatal(err)
+		}
+		term := make(chan os.Signal, 1)
+
+		signal.Notify(term, syscall.SIGTERM|syscall.SIGINT)
+		<-term
+		fmt.Println("exiting")
+
 	}
-
-	term := make(chan os.Signal, 1)
-
-	signal.Notify(term, syscall.SIGTERM|syscall.SIGINT)
-	<-term
-	fmt.Println("exiting")
+	fmt.Println(args)
+	if addDirCmd != nil && *addDirCmd != "" {
+		if len(args) <= 1 {
+			panic("you have to provide a file path")
+		}
+		filePath := args[1]
+		if err := internal.AddDirToWatch(filePath); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("successfully added %s", filePath)
+	}
 }
