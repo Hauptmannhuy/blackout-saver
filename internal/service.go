@@ -22,9 +22,14 @@ type fileWatcher struct {
 }
 
 type appConfig struct {
-	Folders  []string `json:"folders"`
-	Files    []string `json:"files"`
-	jsonFile *os.File
+	Folders      []string         `json:"folders"`
+	Files        []string         `json:"files"`
+	TransportCfg *transportConfig `json:"transport"`
+	jsonFile     *os.File
+}
+
+type transportConfig struct {
+	TransportType string `json:"type"`
 }
 
 func getConfig() (*appConfig, error) {
@@ -49,6 +54,13 @@ func getConfig() (*appConfig, error) {
 			return nil, err
 		}
 	}
+
+	if config.TransportCfg == nil {
+		config.TransportCfg = &transportConfig{
+			TransportType: "",
+		}
+	}
+
 	fmt.Print(*config)
 	return config, nil
 }
@@ -148,3 +160,15 @@ func getConfigJSONFile(filepath string) (*os.File, error) {
 		return os.OpenFile(filepath, os.O_RDWR, 0644)
 	}
 }
+
+// right now support for sftp is planning
+func SetTransport(transport string) error {
+	config, err := getConfig()
+	if err != nil {
+		return err
+	}
+	config.TransportCfg.TransportType = transport
+	return config.saveToJSON(config.jsonFile)
+}
+
+// TODO: think about how to implement uploading data locally with SSH
