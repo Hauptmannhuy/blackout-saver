@@ -1,9 +1,11 @@
 package internal
 
 import (
+	"blackout-saver/transport"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,26 +19,30 @@ const (
 )
 
 type fileWatcher struct {
-	watcher *fsnotify.Watcher
-	config  *appConfig
+	uploader transport.Uploader
+	watcher  *fsnotify.Watcher
+	config   *AppConfig
 }
 
-type appConfig struct {
-	Folders      []string         `json:"folders"`
-	Files        []string         `json:"files"`
-	TransportCfg *transportConfig `json:"transport"`
+type AppConfig struct {
+	Folders      []string                  `json:"folders"`
+	Files        []string                  `json:"files"`
+	TransportCfg transport.TransportConfig `json:"transport"`
 	jsonFile     *os.File
 }
 
-type transportConfig struct {
-	TransportType string `json:"type"`
-}
-
-func getConfig() (*appConfig, error) {
+func getConfig() (*AppConfig, error) {
 	path := filepath.Join(ConfigPath, "config.json")
 	jsonFile, err := getConfigJSONFile(path)
-	config := &appConfig{
+
+	config := &AppConfig{
 		jsonFile: jsonFile,
+	}
+
+	if config.TransportCfg == nil {
+		config.TransportCfg = &transport.TransportConfigBase{
+			TransportType: "",
+		}
 	}
 
 	if err != nil {
@@ -55,12 +61,6 @@ func getConfig() (*appConfig, error) {
 		}
 	}
 
-	if config.TransportCfg == nil {
-		config.TransportCfg = &transportConfig{
-			TransportType: "",
-		}
-	}
-
 	fmt.Print(*config)
 	return config, nil
 }
@@ -74,7 +74,7 @@ func (fileWatcher *fileWatcher) start() {
 	}
 }
 
-func newfileWatcher(config *appConfig) (*fileWatcher, error) {
+func newfileWatcher(config *AppConfig) (*fileWatcher, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -92,17 +92,15 @@ func newfileWatcher(config *appConfig) (*fileWatcher, error) {
 	return fileWatcher, nil
 }
 
-func Start() error {
+func Start() {
 	config, err := getConfig()
 	if err != nil {
 		panic(err)
 	}
 	fileWatcher, err := newfileWatcher(config)
-	if err != nil {
-		return err
-	}
-	go fileWatcher.start()
-	return nil
+
+	log.Fatal(err)
+	fileWatcher.start()
 }
 
 func AddDirToWatch(filePath string) error {
@@ -131,7 +129,7 @@ func AddDirToWatch(filePath string) error {
 	return config.saveToJSON(cfgFile)
 }
 
-func (config *appConfig) saveToJSON(file *os.File) error {
+func (config *AppConfig) saveToJSON(file *os.File) error {
 	data, err := json.Marshal(config)
 	if err != nil {
 		return err
@@ -162,12 +160,16 @@ func getConfigJSONFile(filepath string) (*os.File, error) {
 }
 
 // right now support for sftp is planning
-func SetTransport(transport string) error {
+func SetTransport() error {
 	config, err := getConfig()
 	if err != nil {
-		return err
+		panic(err)
 	}
-	config.TransportCfg.TransportType = transport
+	transportCfg, err := transport.NewTransportConfig()
+	if err != nil {
+		panic(err)
+	}
+	config.TransportCfg = transportCfg
 	return config.saveToJSON(config.jsonFile)
 }
 

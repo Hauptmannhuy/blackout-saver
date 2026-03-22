@@ -9,15 +9,26 @@ import (
 	"syscall"
 
 	"blackout-saver/internal"
+	sftpserver "blackout-saver/server/sftp"
 )
 
 type cliCommand string
 
 const (
-	start     cliCommand = "start"
-	addDir    cliCommand = "add_dir"
-	transport cliCommand = "transport"
+	start        cliCommand = "start"
+	addDir       cliCommand = "add_dir"
+	setTransport cliCommand = "transport"
+	server       cliCommand = "server"
+	connect      cliCommand = "connect"
 )
+
+func runForever(fn func()) {
+	fn()
+	term := make(chan os.Signal, 1)
+	signal.Notify(term, syscall.SIGTERM|syscall.SIGINT)
+	<-term
+	fmt.Println("exiting")
+}
 
 func main() {
 	args := os.Args
@@ -29,21 +40,16 @@ func main() {
 	args = args[1:]
 	flag.CommandLine.Bool("start", false, "starts service")
 	flag.CommandLine.String("add_dir", "", "makes watch over given directories")
-	flag.CommandLine.String("transport", "", "choose transport method to send files")
-
+	flag.CommandLine.Bool("transport", false, "choose transport method to send files")
+	flag.CommandLine.String("connect", "", "connects to the local ssh server")
+	flag.CommandLine.String("server", "", "starts local ssh server")
 	flag.Parse()
 
 	commandHandlers := map[cliCommand]func(){
 		start: func() {
-			if err := internal.Start(); err != nil {
-				log.Fatal(err)
-			}
-			term := make(chan os.Signal, 1)
-
-			signal.Notify(term, syscall.SIGTERM|syscall.SIGINT)
-			<-term
-			fmt.Println("exiting")
-
+			runForever(func() {
+				go internal.Start()
+			})
 		},
 		addDir: func() {
 			if len(args) <= 1 {
@@ -56,12 +62,21 @@ func main() {
 			fmt.Printf("successfully added %s", filePath)
 
 		},
-		transport: func() {
-			if len(args) <= 1 {
-				panic("you have to provide a transport type ('sftp')")
-			}
-			internal.SetTransport(args[1])
+		setTransport: func() {
+			internal.SetTransport()
 		},
+
+		server: func() {
+			runForever(func() {
+				sftpserver.ListenSSH()
+			})
+		},
+		// for debugging
+		// connect: func() {
+		// 	runForever(func() {
+		// 		transport.ConnectSSH()
+		// 	})
+		// },
 	}
 	fmt.Println(cmd)
 	fn, ok := commandHandlers[cmd]
