@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 )
 
@@ -42,4 +43,35 @@ func GetInput(prompt ...string) (string, error) {
 		return "", err
 	}
 	return strings.Trim(input, " "), nil
+}
+
+// Takes input as pointer to configuration structure
+// with exportable JSON fields and 'prompt' tags
+func ConfigPromptInitialize(configuration any) error {
+	refVal := reflect.ValueOf(configuration).Elem()
+	refT := refVal.Type()
+
+	for i := range refT.NumField() {
+		field := refT.Field(i)
+		if field.Type.Kind() != reflect.String {
+			continue
+		}
+
+		prompt := field.Tag.Get("prompt")
+		if len(prompt) == 0 {
+			continue
+		}
+		fmt.Println(prompt)
+		input, err := GetInput(prompt)
+		if err != nil {
+			return err
+		}
+
+		fieldVal := refVal.FieldByName(field.Name)
+		if fieldVal.IsValid() != true {
+			return fmt.Errorf("error occured during setting fields %s field on %s struct is not valid", field.Name, refT.Name())
+		}
+		fieldVal.Set(reflect.ValueOf(input))
+	}
+	return nil
 }
