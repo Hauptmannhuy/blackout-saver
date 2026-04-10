@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
@@ -25,43 +27,57 @@ type sftpServerConfig struct {
 	SSHclientPublicKeyName  string `json:"SSH_CLIENT_PUBLIC_KEY_NAME" prompt:"specify	SSH client public key name"`
 }
 
-func ConfigureServer() {
+type sftpServer struct {
+	listener       *net.TCPListener
+	sshConnections []*ssh.ServerConn
+	sftpConns      []*sftp.Server
+}
+
+type sftpServerKeys struct {
+	clientPubKey    []byte
+	clientKey       ssh.PublicKey
+	serverPrivBytes []byte
+	serverKey       ssh.Signer
+}
+
+func ConfigureServer() error {
 	cfg := &sftpServerConfig{}
 	file, err := os.OpenFile(filepath.Join(configPath, serverConfigName), os.O_RDWR|os.O_CREATE, 0666)
 
-	defer func() {
+	defer func() error {
 		if err := file.Close(); err != nil {
-			panic(err)
+			return err
 		}
-		log.Println("successfully configured server config")
+		slog.Info("successfully configured server config")
+		return nil
 	}()
 
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	_, err = file.Write([]byte{0})
 	if err != nil {
-		panic(err)
+		return err
 	}
 	_, err = file.Seek(0, 0)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	err = utils.ConfigPromptInitialize(cfg)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	cfgData, err := json.Marshal(cfg)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	_, err = file.Write(cfgData)
 	if err != nil {
-		panic(err)
+		return err
 	}
-
+	return nil
 }
 
 func getConfig() (*sftpServerConfig, error) {
@@ -86,8 +102,20 @@ func getConfig() (*sftpServerConfig, error) {
 	return cfg, nil
 }
 
-func ListenSSH() {
+func NewSFTPServer() (*sftpServer, error) {
+	listener, err := net.ListenTCP("tcp", net.TCPAddrFromAddrPort(netip.MustParseAddrPort("0.0.0.0:5001")))
+	if err != nil {
+		log.Fatal(err)
+	}
 
+	slog.Info("initialized tcp listener, waiting for incoming requests")
+	return &sftpServer{
+		listener: listener,
+	}, nil
+
+}
+
+func (server *sftpServer) getKeys() (*sftpServerKeys, error) {
 	config, err := getConfig()
 	if err != nil {
 		panic(err)
@@ -95,34 +123,62 @@ func ListenSSH() {
 
 	clientPubBytes, err := utils.ReadSSHFile(config.SSHclientPublicKeyName)
 	if err != nil {
-		panic(fmt.Sprintf("reading client public key: %s", err.Error()))
+		return nil, fmt.Errorf("reading client public key: %s", err.Error())
 	}
 
 	clientKey, _, _, _, err := ssh.ParseAuthorizedKey(clientPubBytes)
 	if err != nil {
-		panic(fmt.Sprintf("parsing client public key: %s", err.Error()))
+		return nil, fmt.Errorf("parsing client public key: %s", err.Error())
 	}
 
 	serverPrivBytes, err := utils.ReadSSHFile(config.SSHserverKeyPrivateName)
 	if err != nil {
-		panic(fmt.Sprintf("reading server private key: %s", err.Error()))
+		return nil, fmt.Errorf("reading server private key: %s", err.Error())
 	}
 
 	serverKey, err := ssh.ParsePrivateKey(serverPrivBytes)
 	if err != nil {
-		panic(fmt.Sprintf("parsing server private key: %s", err.Error()))
+		return nil, fmt.Errorf("parsing server private key: %s", err.Error())
 	}
+	return &sftpServerKeys{
+		clientPubKey:    clientPubBytes,
+		clientKey:       clientKey,
+		serverPrivBytes: serverPrivBytes,
+		serverKey:       serverKey,
+	}, nil
+}
 
-	listener, err := net.ListenTCP("tcp", net.TCPAddrFromAddrPort(netip.MustParseAddrPort("0.0.0.0:5001")))
+func closeIO[T io.Closer](errs error, items ...T) {
+	for _, c := range items {
+		if err := c.Close(); err != nil {
+			errs = errors.Join(errs, err)
+		}
+	}
+}
+
+func (server *sftpServer) Close() error {
+	var errs error
+
+	closeIO(errs, server.listener)
+	closeIO(errs, server.sftpConns...)
+	closeIO(errs, server.sshConnections...)
+
+	return errs
+}
+
+func (server *sftpServer) Listen() {
+	keys, err := server.getKeys()
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 
-	fmt.Println("initialized tcp listener, waiting for incoming requests")
 	for {
-		conn, err := listener.AcceptTCP()
+		conn, err := server.listener.AcceptTCP()
 		if err != nil {
-			log.Fatal(err)
+			if errors.Is(err, net.ErrClosed) {
+				slog.Info("closing tcp listener")
+				return
+			}
 		}
 		algorithms := ssh.SupportedAlgorithms()
 		serverConfig := &ssh.ServerConfig{
@@ -133,7 +189,7 @@ func ListenSSH() {
 					return nil, err
 				}
 
-				if !bytes.Equal(key.Marshal(), clientKey.Marshal()) {
+				if !bytes.Equal(key.Marshal(), keys.clientKey.Marshal()) {
 					return nil, fmt.Errorf("unathorized")
 				}
 				return nil, nil
@@ -143,25 +199,32 @@ func ListenSSH() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		serverConfig.AddHostKey(serverKey)
-		_, rootChannel, rootReqCh, err := ssh.NewServerConn(conn, serverConfig)
+		serverConfig.AddHostKey(keys.serverKey)
+		sshServer, rootChannel, rootReqCh, err := ssh.NewServerConn(conn, serverConfig)
+		server.sshConnections = append(server.sshConnections, sshServer)
+
 		if err != nil {
 			log.Fatal(err)
 		}
-		fmt.Println("ssh server initialized")
+		slog.Info("ssh server initialized")
 
 		go func() {
 			for {
 				select {
 				case req := <-rootReqCh:
-					fmt.Println(req.Type, string(req.Payload), req.WantReply, req.Type == "establish sftp")
+					if req == nil {
+						continue
+					}
 				case ch := <-rootChannel:
-					fmt.Println("new channel", ch.ChannelType(), "extracted data", string(ch.ExtraData()))
+					if ch == nil {
+						continue
+					}
+					slog.Info("new channel", "new channel", ch.ChannelType(), "extracted data", string(ch.ExtraData()))
 					newCh, newReqCh, err := ch.Accept()
 					if err != nil {
 						log.Fatal(err)
 					}
-					go listenForSFTPRequest(newCh, newReqCh)
+					go server.handleSSHmsg(newCh, newReqCh)
 				}
 			}
 		}()
@@ -169,43 +232,49 @@ func ListenSSH() {
 	}
 }
 
-func listenForSFTPRequest(ch ssh.Channel, req <-chan *ssh.Request) {
-	sftpChan := make(chan ssh.Channel)
-
-	go func() {
-		fmt.Println("waiting for sftp chan")
-		conn := <-sftpChan
-		server, err := sftp.NewServer(conn)
-		fmt.Println("created sftp server and listening")
-		if err != nil {
-			panic(err)
-		}
-		if err := server.Serve(); err != nil {
-			panic(err)
-		}
-	}()
-
+func (server *sftpServer) handleSSHmsg(ch ssh.Channel, req <-chan *ssh.Request) {
 	for inReq := range req {
 		if inReq == nil {
 			continue
 		}
-
 		if strings.Contains(string(inReq.Payload), "sftp") {
-			fmt.Println("sftp request received")
+			slog.Info("sftp request received")
 			var err error
 
 			err = inReq.Reply(true, []byte("ok"))
 			if err != nil {
 				panic(err)
 			}
-			sftpChan <- ch
+			go server.serveSFTP(ch)
 		} else {
-			fmt.Println("received not interesting request")
+			fmt.Printf("received ssh message %s\n", string(inReq.Payload))
 			err := ch.Close()
 			if err != nil {
 				panic(err)
 			}
 			return
 		}
+	}
+	if err := ch.Close(); err != nil {
+		if errors.Is(err, io.EOF) {
+			slog.Info(err.Error())
+			return
+		}
+		slog.Info("error in ssh channel", slog.Any("error:", err))
+	}
+
+}
+
+func (server *sftpServer) serveSFTP(conn io.ReadWriteCloser) {
+
+	newConn, err := sftp.NewServer(conn, sftp.WithDebug(os.Stderr))
+	if err != nil {
+		panic(err)
+	}
+	slog.Info("created sftp server and listening")
+
+	server.sftpConns = append(server.sftpConns, newConn)
+	if err := newConn.Serve(); err != nil {
+		panic(err)
 	}
 }

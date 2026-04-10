@@ -4,13 +4,13 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"blackout-saver/internal"
 	sftpserver "blackout-saver/server/sftp"
-	"blackout-saver/transport"
 )
 
 type cliCommand string
@@ -24,14 +24,6 @@ const (
 	//debug
 	connect cliCommand = "connect"
 )
-
-func runForever(fn func()) {
-	go fn()
-	term := make(chan os.Signal, 1)
-	signal.Notify(term, syscall.SIGTERM|syscall.SIGINT)
-	<-term
-	fmt.Println("exiting")
-}
 
 func main() {
 	args := os.Args
@@ -49,11 +41,29 @@ func main() {
 	flag.CommandLine.Bool(string(configureSSHServer), false, "configures ssh server")
 	flag.Parse()
 
+	config := slog.HandlerOptions{
+		AddSource: true,
+	}
+	handler := slog.NewTextHandler(os.Stderr, &config)
+
+	slog.SetDefault(slog.New(handler))
+
 	commandHandlers := map[cliCommand]func(){
 		start: func() {
-			runForever(func() {
-				internal.Start()
-			})
+			fWatcher, err := internal.Start()
+			if err != nil {
+				log.Fatal("error starting app", err)
+			}
+			term := make(chan os.Signal, 1)
+			signal.Notify(term, syscall.SIGINT, syscall.SIGTERM)
+			slog.Info("application succesfully started")
+			sig := <-term
+			fmt.Println("received", "signal", sig.String())
+
+			if err := fWatcher.Close(); err != nil {
+				fmt.Println(err)
+			}
+			fmt.Println("app gracefully shutted down")
 		},
 		addDir: func() {
 			if len(args) <= 1 {
@@ -63,7 +73,7 @@ func main() {
 			if err := internal.AddDirToWatch(filePath); err != nil {
 				log.Fatal(err)
 			}
-			fmt.Printf("successfully added %s", filePath)
+			fmt.Printf("successfully added %s\n", filePath)
 
 		},
 		setTransport: func() {
@@ -71,22 +81,26 @@ func main() {
 		},
 
 		server: func() {
-			runForever(func() {
-				sftpserver.ListenSSH()
-			})
+			server, err := sftpserver.NewSFTPServer()
+			if err != nil {
+				panic(err)
+			}
+			go server.Listen()
+			term := make(chan os.Signal, 1)
+			signal.Notify(term, syscall.SIGTERM, syscall.SIGINT)
+			<-term
+			if err := server.Close(); err != nil {
+				fmt.Println("error during server close", err)
+				return
+			}
+			fmt.Println("server shutted down gracefully")
 		},
 
 		configureSSHServer: func() {
-			sftpserver.ConfigureServer()
-		},
-		//for debugging
-		connect: func() {
-			runForever(func() {
-				transport.NewUploader(&transport.SFTPconfig{
-					RemoteServerPub: "server_sftp_blackout_key.pub",
-					ClientPrivate:   "id_ed25519_client_blackout_sftp",
-				})
-			})
+			err := sftpserver.ConfigureServer()
+			if err != nil {
+				log.Fatal(err)
+			}
 		},
 	}
 	fn, ok := commandHandlers[cmd]

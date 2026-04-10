@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,21 +37,142 @@ type AppConfig struct {
 }
 
 type workerPool struct {
-	tasks   chan string
-	results chan []byte
+	tasks chan string
+}
+
+func newfileWatcher(config *AppConfig) (*fileWatcher, error) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, err
+	}
+
+	uploader, err := transport.NewUploader(config.TransportCfg)
+	if err != nil {
+		return nil, err
+	}
+
+	fileWatcher := &fileWatcher{
+		config:   config,
+		watcher:  watcher,
+		uploader: uploader,
+		pool:     newWorkerPool(uploader),
+	}
+
+	for _, v := range append(config.Files, config.Folders...) {
+		err := watcher.Add(v)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return fileWatcher, nil
+}
+
+func (fWatcher *fileWatcher) Close() error {
+	var errs error
+	close(fWatcher.pool.tasks)
+
+	if err := fWatcher.watcher.Close(); err != nil {
+		errors.Join(errs, fmt.Errorf("error closing file event watcher: %s", err.Error()))
+	}
+	if err := fWatcher.uploader.Close(); err != nil {
+		errors.Join(errs, fmt.Errorf("error closing uploader %s", err.Error()))
+	}
+	return errs
+}
+
+func (fWatcher *fileWatcher) reload() error {
+	return nil
+}
+
+func (fw *fileWatcher) watchEvents() {
+	for {
+		select {
+		case event, ok := <-fw.watcher.Events:
+			if !ok {
+				return
+			}
+			path := event.Name
+			if event.Has(fsnotify.Write) {
+				slog.Info("new event with path", path, event.Op.String())
+				fw.pool.tasks <- path
+			}
+		case eventErr, ok := <-fw.watcher.Errors:
+			if !ok {
+				return
+			}
+			if eventErr != nil {
+				slog.Error("error during file watch", "err", eventErr)
+			}
+		}
+	}
 }
 
 func newWorkerPool(uploader transport.Uploader) *workerPool {
+	const workerNum = 50
 	flightMap := map[string]time.Time{}
 	mutex := &sync.Mutex{}
 
-	const workerNum = 50
 	tasks := make(chan string)
 	for range workerNum {
 		go worker(tasks, uploader, mutex, flightMap)
 	}
 	return &workerPool{
 		tasks: tasks,
+	}
+}
+
+func worker(tasks <-chan string, uploader transport.Uploader, mutex *sync.Mutex, flightMap map[string]time.Time) {
+	for path := range tasks {
+		var f *os.File
+		var processor fileProcessor
+		var err error
+
+		mutex.Lock()
+		timestamp, ok := flightMap[path]
+
+		if !ok {
+			flightMap[path] = time.Now()
+		} else {
+			now := time.Now()
+			difference := now.Sub(timestamp)
+			slog.Info(difference.String())
+			operand := time.Second * 5
+			if difference <= operand {
+				slog.Info("skip")
+				mutex.Unlock()
+				continue
+			} else {
+				flightMap[path] = now
+			}
+		}
+
+		mutex.Unlock()
+
+		processor, err = processFile(path)
+
+		if err != nil {
+			slog.Error("error processing file before upload", "error", err)
+			goto END
+		}
+
+		f, err = processor.getFile()
+		if err != nil {
+			slog.Error("error getting result file from processor", "error", err)
+			goto END
+		}
+		slog.Info("successfully retrieved file", "name", f.Name())
+
+		if err = uploader.Upload(f); err != nil {
+			slog.Error("error uploading files", "err", err)
+		}
+
+	END:
+		err = processor.dispose()
+		if err != nil {
+			slog.Error("error disposing processor data", "err", err)
+		}
+
 	}
 }
 
@@ -72,15 +193,15 @@ func (fxtrcter *fileExtracter) dispose() error {
 		return nil
 	}
 	if err := fxtrcter.file.Close(); err != nil {
-		log.Println("error closing temp file", fxtrcter.file.Name())
+		slog.Error("error closing temp file", slog.Any("error", err.Error()))
 		return err
 	}
 	if err := os.Remove(fxtrcter.file.Name()); err != nil {
-		log.Println("error removing file", fxtrcter.file.Name())
+		slog.Error("error removing file", slog.Any("error", err.Error()))
 		return err
 	}
 
-	log.Println("removed temp file ", fxtrcter.file.Name())
+	slog.Info("removed temp file ", "name", fxtrcter.file.Name())
 	return nil
 }
 
@@ -129,7 +250,7 @@ type gitFileProcessor struct {
 func (processor *gitFileProcessor) process(path string) error {
 	err := executeCommand(path, processor.file, "git", "diff")
 	if err != nil {
-		log.Println("couldn't create git patch from recent changes, error: ", err.Error())
+		slog.Error("couldn't create git patch from recent changes, error: ", err.Error(), slog.Any("error", err.Error()))
 		return err
 	}
 	return nil
@@ -148,67 +269,12 @@ func (extracter *fileExtracter) initialize(path string) error {
 
 	file, err := os.CreateTemp(os.TempDir(), fmt.Sprintf("%s-*", filename))
 	if err != nil {
-		log.Println(err)
+		slog.Error(err.Error())
 		return err
 	}
 
 	extracter.file = file
 	return nil
-}
-
-func worker(tasks <-chan string, uploader transport.Uploader, mutex *sync.Mutex, flightMap map[string]time.Time) {
-	for path := range tasks {
-		var f *os.File
-		var processor fileProcessor
-		var err error
-
-		timestamp, ok := flightMap[path]
-
-		mutex.Lock()
-		if !ok {
-			flightMap[path] = time.Now()
-		} else {
-			now := time.Now()
-			difference := now.Sub(timestamp)
-			operand := time.Second * 2
-			if difference <= operand {
-				fmt.Println("skip")
-				continue
-			}
-		}
-
-		mutex.Unlock()
-
-		processor, err = processFile(path)
-
-		if err != nil {
-			log.Printf("error processing file before upload %s\n", err.Error())
-			goto END
-		}
-
-		f, err = processor.getFile()
-		if err != nil {
-			log.Println("error getting result file from processor", err.Error())
-			goto END
-		}
-		log.Println("successfully retrieved file", f.Name())
-
-		if err = uploader.Upload(f); err != nil {
-			log.Println("error uploading files", err)
-		}
-		time.Sleep(time.Second * 3)
-
-	END:
-		err = processor.dispose()
-		if err != nil {
-			log.Println("error disposing processor data", err.Error())
-		}
-
-		mutex.Lock()
-		delete(flightMap, path)
-		mutex.Unlock()
-	}
-
 }
 
 func getConfig() (*AppConfig, error) {
@@ -249,58 +315,23 @@ func getConfig() (*AppConfig, error) {
 		return nil, err
 	}
 
-	fmt.Println(*config)
 	return config, nil
 }
 
-func (fileWatcher *fileWatcher) start() {
-	for event := range fileWatcher.watcher.Events {
-		path := event.Name
-		if event.Has(fsnotify.Write) {
-			fmt.Println("new event with path", path, event.Op.String())
-			fileWatcher.pool.tasks <- path
-		}
-	}
-}
-
-func newfileWatcher(config *AppConfig) (*fileWatcher, error) {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return nil, err
-	}
-
-	uploader, err := transport.NewUploader(config.TransportCfg)
-	if err != nil {
-		return nil, err
-	}
-
-	fileWatcher := &fileWatcher{
-		config:   config,
-		watcher:  watcher,
-		uploader: uploader,
-		pool:     newWorkerPool(uploader),
-	}
-
-	for _, v := range append(config.Files, config.Folders...) {
-		err := watcher.Add(v)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return fileWatcher, nil
-}
-
-func Start() {
+func Start() (*fileWatcher, error) {
 	config, err := getConfig()
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
+
 	fileWatcher, err := newfileWatcher(config)
 	if err != nil {
-		panic(err)
-
+		return nil, err
 	}
-	fileWatcher.start()
+
+	go fileWatcher.watchEvents()
+
+	return fileWatcher, nil
 }
 
 func AddDirToWatch(filePath string) error {
@@ -362,7 +393,6 @@ func getConfigJSONFile(filepath string) (*os.File, error) {
 	}
 }
 
-// right now support for sftp is planning
 func SetTransport() error {
 	config, err := getConfig()
 	if err != nil {
@@ -375,5 +405,3 @@ func SetTransport() error {
 	config.TransportCfg = transportCfg
 	return config.saveToJSON(config.jsonFile)
 }
-
-// TODO: think about how to implement uploading data locally with SSH

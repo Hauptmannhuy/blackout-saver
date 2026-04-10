@@ -2,6 +2,7 @@ package utils
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -61,7 +62,7 @@ func ConfigPromptInitialize(configuration any) error {
 		if len(prompt) == 0 {
 			continue
 		}
-		fmt.Println(prompt)
+		slog.Info(prompt)
 		input, err := GetInput(prompt)
 		if err != nil {
 			return err

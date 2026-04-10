@@ -3,12 +3,14 @@ package transport
 import (
 	"blackout-saver/utils"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -16,6 +18,8 @@ import (
 
 type Uploader interface {
 	Upload(data *os.File) error
+	Close() error
+	Connect() error
 }
 
 type transportType string
@@ -29,7 +33,7 @@ type TransportConfigBase struct {
 }
 
 type SFTPUploader struct {
-	cfg        SFTPconfig
+	cfg        *SFTPconfig
 	sftpClient *sftp.Client
 	sshClient  *ssh.Client
 }
@@ -39,12 +43,6 @@ type SFTPconfig struct {
 	RemoteServerPub string `json:"remote_server_pub" prompt:"Specify path for remote server public key"`
 	ClientPrivate   string `json:"client_private" prompt:"Specify path for client private key"`
 }
-
-// func (cfg SFTPconfig) UnmarshalJSON(data []byte) error {
-// 	var t struct {
-// 	}
-// 	return json.Unmarshal(data, &cfg)
-// }
 
 type TransportConfig interface {
 	GetType() transportType
@@ -59,18 +57,24 @@ func (t *TransportConfigBase) SetTransportType(name transportType) {
 	t.TransportType = name
 }
 
-func (sftpUloader *SFTPUploader) connectSSH(cfg *SFTPconfig) error {
+func (uploader *SFTPUploader) Connect() error {
+	cfg := uploader.cfg
+	if cfg == nil {
+		return fmt.Errorf("config is nil")
+	}
 	clientKey, err := utils.ReadSSHFile(cfg.ClientPrivate)
 	if err != nil {
-		log.Fatal(fmt.Errorf("client ssh key not found: %w, generate it with ssh-keygen, example ssh-keygen -t ed25519, path: .../.ssh/id_ed25519_client_blackout_sftp", err))
+		return fmt.Errorf("client ssh key not found: %w, generate it with ssh-keygen, example ssh-keygen -t ed25519, path: .../.ssh/id_ed25519_client_blackout_sftp", err)
 	}
 
 	private, err := ssh.ParsePrivateKey(clientKey)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
-	sshClient, err := ssh.Dial("tcp", "0.0.0.0:5001", &ssh.ClientConfig{
+	addr := "0.0.0.0:5001"
+	slog.Info("trying to connect to ", "ip", addr)
+	sshClient, err := ssh.Dial("tcp", addr, &ssh.ClientConfig{
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(private),
 		},
@@ -91,18 +95,17 @@ func (sftpUloader *SFTPUploader) connectSSH(cfg *SFTPconfig) error {
 		},
 	})
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
-	fmt.Println("trying to establish sftp...")
+	slog.Info("trying to establish sftp...")
 	client, err := sftp.NewClient(sshClient)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	fmt.Println("sftp connection established")
-	fmt.Println("sftpUloader.sftpClient == nil", client == nil)
-	sftpUloader.sftpClient = client
-	sftpUloader.sshClient = sshClient
+	slog.Info("sftp connection established")
+	uploader.sftpClient = client
+	uploader.sshClient = sshClient
 	return nil
 }
 
@@ -144,41 +147,82 @@ func NewUploader(config TransportConfig) (Uploader, error) {
 	var err error
 	switch cfg := config.(type) {
 	case *SFTPconfig:
-		uploader, err = newSFTPUploader(cfg)
+		uploader = &SFTPUploader{
+			cfg: cfg,
+		}
 	}
 
-	return uploader, err
-}
+	retries := 15
 
-func newSFTPUploader(config *SFTPconfig) (*SFTPUploader, error) {
-	uploader := &SFTPUploader{}
-	err := uploader.connectSSH(config)
+	for i := 1; i <= retries; i++ {
+		err = uploader.Connect()
+		if err == nil {
+			slog.Info("connected to remote storage")
+			break
+		}
+
+		var netErr net.Error
+		if !errors.As(err, &netErr) {
+			slog.Error("couldn't connect to remote storage via client error, exiting", "error", err)
+			break
+		}
+
+		slog.Warn("couldn't connect to remote storage server",
+			"error", err,
+			"attempt", i,
+			"max_retries", retries,
+		)
+
+		if i < retries {
+			time.Sleep(2 * time.Second)
+		}
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect after %d retries: %w", retries, err)
+	}
 	return uploader, err
+
 }
 
 func (sftpUploader SFTPUploader) Upload(file *os.File) error {
 	sftpClient := sftpUploader.sftpClient
 	remotePath := filepath.Join("storage", file.Name())
-	fmt.Println("sftpClient == nil", sftpClient == nil)
 	if err := sftpClient.MkdirAll(filepath.Dir(remotePath)); err != nil {
-		log.Println("error creating dir", err.Error(), remotePath)
+		slog.Info("error creating dir", err.Error(), remotePath)
 	}
+
 	sftpFile, err := sftpClient.Create(remotePath)
 	if err != nil {
-		log.Println("error: sftpClient.Create(remotePath)", err.Error())
-		return err
+		return fmt.Errorf("error creating static storage %s", err.Error())
+
 	}
 
 	data, err := io.ReadAll(file)
 	if err != nil {
-		return err
+		return fmt.Errorf("couldn't read file %s, error: %s", file.Name(), err.Error())
 	}
 
 	_, err = sftpFile.Write(data)
 	if err != nil {
-		log.Println("error: sftpFile.Write", err.Error())
-		return err
+		return fmt.Errorf("error writing to received sftp file %w", err)
+
+	}
+
+	if err := sftpFile.Close(); err != nil {
+		return fmt.Errorf("error closing sftp file %w", err)
 	}
 
 	return nil
+}
+
+func (uploader *SFTPUploader) Close() error {
+	var err error
+	if sshErr := uploader.sshClient.Close(); sshErr != nil {
+		errors.Join(err, sshErr)
+	}
+	if sftpErr := uploader.sftpClient.Close(); sftpErr != nil {
+		return errors.Join(err, sftpErr)
+	}
+	return err
 }
