@@ -42,6 +42,8 @@ type SFTPconfig struct {
 	TransportConfigBase
 	RemoteServerPub string `json:"remote_server_pub" prompt:"Specify path for remote server public key"`
 	ClientPrivate   string `json:"client_private" prompt:"Specify path for client private key"`
+	IP              string `json:"ip" prompt:"specify ip of a remote sftp server"`
+	Port            string `json:"port" prompt:"specify port of a remote sftp server"`
 }
 
 type TransportConfig interface {
@@ -72,7 +74,7 @@ func (uploader *SFTPUploader) Connect() error {
 		return err
 	}
 
-	addr := "0.0.0.0:5001"
+	addr := fmt.Sprintf("%s:%s", cfg.IP, cfg.Port)
 	slog.Info("trying to connect to ", "ip", addr)
 	sshClient, err := ssh.Dial("tcp", addr, &ssh.ClientConfig{
 		Auth: []ssh.AuthMethod{
@@ -137,6 +139,11 @@ func NewTransportConfig() (TransportConfig, error) {
 
 	if err := utils.ConfigPromptInitialize(transportCfg); err != nil {
 		return nil, err
+	}
+	switch cfg := transportCfg.(type) {
+	case *SFTPconfig:
+		utils.NormalizeSSHfilePath(&cfg.ClientPrivate)
+		utils.NormalizeSSHfilePath(&cfg.RemoteServerPub)
 	}
 	transportCfg.SetTransportType(t)
 	return transportCfg, nil

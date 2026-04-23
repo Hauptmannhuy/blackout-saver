@@ -277,20 +277,34 @@ func (extracter *fileExtracter) initialize(path string) error {
 	return nil
 }
 
-func getConfig() (*AppConfig, error) {
-	var jsonData []byte
+func getConfig(errOnNonExist bool) (*AppConfig, error) {
 	path := filepath.Join(ConfigPath, configFileName)
-	jsonFile, err := getConfigJSONFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	if jsonData, err = io.ReadAll(jsonFile); err != nil {
-		return nil, err
-	}
+	jsonFile, err := getConfigJSONFile(path, errOnNonExist)
 
 	config := &AppConfig{
 		jsonFile: jsonFile,
+	}
+	if errOnNonExist && err != nil {
+		return nil, err
+	}
+
+	if !errOnNonExist && err != nil && os.IsNotExist(err) {
+		return config, nil
+	}
+
+	if err := readJSONconfig(jsonFile, config); err != nil {
+		return nil, err
+	}
+
+	return config, nil
+}
+
+func readJSONconfig(jsonFile *os.File, config *AppConfig) error {
+	var jsonData []byte
+	var err error
+
+	if jsonData, err = io.ReadAll(jsonFile); err != nil {
+		return err
 	}
 
 	var raw struct {
@@ -301,25 +315,25 @@ func getConfig() (*AppConfig, error) {
 
 	err = json.Unmarshal(jsonData, &raw)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	transportCfg, err := transport.GetConfigContainer(string(raw.Transport.GetType()))
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	config.TransportCfg = transportCfg
 
 	if err := json.Unmarshal(jsonData, config); err != nil {
-		return nil, err
+		return err
 	}
 
-	return config, nil
+	return nil
 }
 
 func Start() (*fileWatcher, error) {
-	config, err := getConfig()
+	config, err := getConfig(true)
 	if err != nil {
 		return nil, err
 	}
@@ -336,7 +350,7 @@ func Start() (*fileWatcher, error) {
 
 func AddDirToWatch(filePath string) error {
 	var containerToAppend *[]string
-	config, err := getConfig()
+	config, err := getConfig(false)
 	cfgFile := config.jsonFile
 
 	if err != nil {
@@ -377,14 +391,20 @@ func (config *AppConfig) saveToJSON(file *os.File) error {
 	return file.Close()
 }
 
-func getConfigJSONFile(filepath string) (*os.File, error) {
+func getConfigJSONFile(filepath string, errorOnNonExist bool) (*os.File, error) {
 	var f *os.File
 	_, err := os.Stat(filepath)
 	if err != nil && os.IsNotExist(err) {
+		if errorOnNonExist {
+			return nil, err
+		}
 		var createErr error
 		f, createErr = os.OpenFile(filepath, os.O_RDWR|os.O_CREATE, 0644)
 		if createErr != nil {
 			return nil, errors.Join(err, createErr)
+		}
+		if !errorOnNonExist {
+			return f, err
 		}
 		return f, nil
 
@@ -394,7 +414,7 @@ func getConfigJSONFile(filepath string) (*os.File, error) {
 }
 
 func SetTransport() error {
-	config, err := getConfig()
+	config, err := getConfig(false)
 	if err != nil {
 		panic(err)
 	}

@@ -16,13 +16,12 @@ import (
 type cliCommand string
 
 const (
-	start              cliCommand = "start"
-	addDir             cliCommand = "add_dir"
-	setTransport       cliCommand = "transport"
-	server             cliCommand = "server"
-	configureSSHServer cliCommand = "config_server_ssh"
-	//debug
-	connect cliCommand = "connect"
+	start               cliCommand = "start"
+	addDir              cliCommand = "add_dir"
+	setTransport        cliCommand = "transport"
+	server              cliCommand = "server"
+	configureSFTPserver cliCommand = "config_server_ssh"
+	help                cliCommand = "help"
 )
 
 func main() {
@@ -36,9 +35,9 @@ func main() {
 	flag.CommandLine.Bool(string(start), false, "starts service")
 	flag.CommandLine.String(string(addDir), "", "makes watch over given directories")
 	flag.CommandLine.Bool(string(setTransport), false, "choose transport method to send files")
-	flag.CommandLine.String(string(server), "", "connects to the local ssh server")
-	flag.CommandLine.String(string(connect), "", "starts local ssh server")
-	flag.CommandLine.Bool(string(configureSSHServer), false, "configures ssh server")
+	flag.CommandLine.String(string(server), "", "starts local sftp server")
+	flag.CommandLine.Bool(string(configureSFTPserver), false, "configures sftp server")
+	flag.CommandLine.Bool(string(help), false, "lists available commands")
 	flag.Parse()
 
 	config := slog.HandlerOptions{
@@ -52,7 +51,7 @@ func main() {
 		start: func() {
 			fWatcher, err := internal.Start()
 			if err != nil {
-				log.Fatal("error starting app", err)
+				log.Fatal("error starting app ", err)
 			}
 			term := make(chan os.Signal, 1)
 			signal.Notify(term, syscall.SIGINT, syscall.SIGTERM)
@@ -95,8 +94,15 @@ func main() {
 			}
 			fmt.Println("server shutted down gracefully")
 		},
+		help: func() {
+			cmds := []cliCommand{start, addDir, setTransport, server, configureSFTPserver, help}
+			for _, cmd := range cmds {
+				fmt.Println(cmd)
 
-		configureSSHServer: func() {
+			}
+		},
+
+		configureSFTPserver: func() {
 			err := sftpserver.ConfigureServer()
 			if err != nil {
 				log.Fatal(err)

@@ -19,15 +19,19 @@ var basePath string = func() string {
 
 }()
 
-func GetSSHFile(name string) (*os.File, error) {
-	file, err := os.Open(filepath.Join(basePath, name))
-	if err != nil {
-		return nil, fmt.Errorf("couldn't open file %w", err)
+func NormalizeSSHfilePath(filename *string) {
+	path := filepath.Join(basePath, *filename)
+	_, err := os.Stat(path)
+	if err != nil && os.IsNotExist(err) {
+		return
 	}
-	return file, nil
+	*filename = path
 }
 
 func ReadSSHFile(name string) ([]byte, error) {
+	if f, err := os.ReadFile(name); err == nil {
+		return f, nil
+	}
 	return os.ReadFile(filepath.Join(basePath, name))
 }
 
